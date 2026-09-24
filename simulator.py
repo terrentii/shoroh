@@ -1,9 +1,13 @@
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.signal import fftconvolve, resample_poly
 from scipy.special import erfc
 
 гсч = np.random.default_rng(0)
-ПОДНЕСУЩИХ, ПРЕФИКС = 64, 16
+ПОДНЕСУЩИХ, ПРЕФИКС = 1024, 256
+ПОЛОСА = 4000
 
 
 def awgn(сигнал, EbN0_дб, бит_на_символ):
@@ -46,9 +50,16 @@ def ofdm_мод(биты):
     return np.hstack([время[:, -ПРЕФИКС:], время]).ravel()
 
 
-def ofdm_демод(сигнал):
+def ofdm_демод(сигнал, передаточная=1):
     время = сигнал.reshape(-1, ПОДНЕСУЩИХ + ПРЕФИКС)[:, ПРЕФИКС:]
-    return qpsk_демод(np.fft.fft(время, norm="ortho").ravel())
+    return qpsk_демод((np.fft.fft(время, norm="ortho") / передаточная).ravel())
+
+
+def канал_из_их(их, частота_дискр, несущая):
+    время = np.arange(их.size) / частота_дискр
+    узкая = resample_poly(их * np.exp(-2j * np.pi * несущая * время), 1, частота_дискр // ПОЛОСА)
+    узкая = узкая[np.argmax(np.abs(узкая)) :]
+    return узкая / np.linalg.norm(узкая)
 
 
 def q_теория(EbN0):
@@ -63,15 +74,23 @@ def q_теория(EbN0):
 }
 
 
-def ber(название, EbN0_дб, число_бит=2**20):
+def ber(название, EbN0_дб, число_бит=2**20, канал=np.ones(1)):
     мод, демод, бит_на_символ, _ = МОДУЛЯЦИИ[название]
     биты = гсч.integers(0, 2, число_бит)
-    принято = демод(awgn(мод(биты), EbN0_дб, бит_на_символ))
-    return np.mean(принято != биты)
+    сигнал = мод(биты)
+    if канал.size > 1:
+        сигнал = fftconvolve(сигнал, канал)[: сигнал.size]
+    принято = awgn(сигнал, EbN0_дб, бит_на_символ)
+    if название == "OFDM":
+        оценка = ofdm_демод(принято, np.fft.fft(канал, ПОДНЕСУЩИХ))
+    else:
+        оценка = демод(принято / канал[0])
+    return np.mean(оценка != биты)
 
 
-if __name__ == "__main__":
+def график_awgn():
     шкала_дб = np.arange(0, 10)
+    plt.figure()
     for название, (*_, теория) in МОДУЛЯЦИИ.items():
         точки = [ber(название, дб, 2**21) for дб in шкала_дб]
         линия, = plt.semilogy(шкала_дб, точки, "o", label=f"{название} симуляция")
@@ -80,4 +99,30 @@ if __name__ == "__main__":
     plt.ylabel("BER")
     plt.grid(which="both", alpha=0.3)
     plt.legend()
-    plt.savefig("ber_awgn.png", dpi=150)
+    plt.savefig("figures/ber_awgn.png", dpi=150)
+
+
+def график_комнаты(метка, частота_дискр=192000):
+    их = np.load(f"channels/{метка}.npy")
+    шкала_дб = np.arange(0, 32, 2)
+    plt.figure(figsize=(8, 5))
+    plt.semilogy(шкала_дб, q_теория(10 ** (шкала_дб / 10)), "k--", label="AWGN, теория")
+    for несущая in (5000, 20000):
+        канал = канал_из_их(их, частота_дискр, несущая)
+        for название, маркер in (("QPSK", "o-"), ("OFDM", "s-")):
+            точки = [max(ber(название, дб, канал=канал), 1e-7) for дб in шкала_дб]
+            plt.semilogy(шкала_дб, точки, маркер, label=f"{название}, {несущая // 1000} кГц")
+    plt.ylim(1e-6, 1)
+    plt.xlabel("Eb/N0, дБ")
+    plt.ylabel("BER")
+    plt.title(f"Реальный канал «{метка}», полоса {ПОЛОСА // 1000} кГц")
+    plt.grid(which="both", alpha=0.3)
+    plt.legend()
+    plt.savefig(f"figures/ber_{метка}.png", dpi=150)
+
+
+if __name__ == "__main__":
+    Path("figures").mkdir(exist_ok=True)
+    график_awgn()
+    for файл in Path("channels").glob("*.npy"):
+        график_комнаты(файл.stem)
