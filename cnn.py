@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -6,7 +7,7 @@ import torch
 import matplotlib.pyplot as plt
 from torch import nn
 
-from simulator import ОТВОДОВ, СЦЕНАРИИ, ber_приёмника, канал_из_их, mmse, принять, qpsk_демод, qpsk_мод, q_теория
+from simulator import ИСКАЖЕНИЯ, ОТВОДОВ, СЦЕНАРИИ, исказить, ber_приёмника, канал_из_их, mmse, принять, qpsk_демод, qpsk_мод, q_теория
 
 устройство = "cuda" if torch.cuda.is_available() else "cpu"
 ЗАДЕРЖКА = ОТВОДОВ // 4
@@ -14,6 +15,15 @@ from simulator import ОТВОДОВ, СЦЕНАРИИ, ber_приёмника, 
 ШАГОВ, ПАКЕТ = 20000, 2048
 ОБУЧЕНИЕ_MMSE = 2**16
 ШКАЛА_ДБ = np.arange(0, 31, 3)
+СЕРИЯ = {
+    "без искажений": ("гитара_чисто", None, None),
+    "TS 33": ("гитара_ts_g33", "TS33", -44.9),
+    "TS 66": ("гитара_ts_g66", "TS66", -29.8),
+    "TS 100": ("гитара_ts_g100", "TS100", -14.5),
+    "RAT 33": ("гитара_rat_d33", "RAT33", -35.7),
+    "RAT 66": ("гитара_rat_d66", "RAT66", -17.2),
+    "RAT 100": ("гитара_rat_d100", "RAT100", -13.7),
+}
 
 
 class Приёмник(nn.Module):
@@ -85,8 +95,7 @@ def ber_mmse_сытый(канал, искажение, EbN0_дб, символ�
     return np.mean(qpsk_демод(выровнено)[2 * ОБУЧЕНИЕ_MMSE :] != биты[2 * ОБУЧЕНИЕ_MMSE :])
 
 
-def сравнить(название):
-    метка, искажение = СЦЕНАРИИ[название]
+def сравнить(название, метка, искажение):
     канал = канал_из_их(np.load(f"channels/{метка}.npy"), 192000, 2000)
     print(название, flush=True)
     модель = обучить(канал, искажение)
@@ -110,10 +119,64 @@ def сравнить(название):
     plt.legend()
     plt.savefig(f"figures/cnn_{название}.png", dpi=150)
     plt.close()
+    Path("results").mkdir(exist_ok=True)
+    Path(f"results/{название}.json").write_text(json.dumps({к: [float(т) for т in в] for к, в in кривые.items()}, ensure_ascii=False))
+
+
+def сигнал_искажение(искажение, сигнал):
+    сигнал = сигнал / np.sqrt(np.mean(np.abs(сигнал) ** 2))
+    выход = исказить(сигнал, *ИСКАЖЕНИЯ[искажение], 2000)
+    усиление = np.vdot(сигнал, выход) / np.vdot(сигнал, сигнал)
+    return 10 * np.log10(np.abs(усиление) ** 2 / np.mean(np.abs(выход - усиление * сигнал) ** 2))
+
+
+def нужный_snr(точки, цель=1e-3):
+    lg = np.log10(np.maximum(точки, 1e-9))
+    ниже = np.nonzero(lg <= np.log10(цель))[0]
+    if ниже.size == 0 or ниже[0] == 0:
+        return np.nan
+    i = ниже[0]
+    return ШКАЛА_ДБ[i - 1] + (np.log10(цель) - lg[i - 1]) / (lg[i] - lg[i - 1]) * (ШКАЛА_ДБ[i] - ШКАЛА_ДБ[i - 1])
+
+
+def график_серии():
+    qpsk = qpsk_мод(np.random.randint(0, 2, 2**17))
+    print("| сценарий | 3-я гармоника синуса, дБ | SDR QPSK, дБ | CNN | MMSE | OFDM, пилоты | выигрыш CNN над MMSE, дБ |")
+    print("|---|---|---|---|---|---|---|")
+    _, ось = plt.subplots(figsize=(8, 5))
+    for семейство, маркер in (("TS", "o"), ("RAT", "s")):
+        точки = []
+        for название, (_, искажение, гармоника) in СЕРИЯ.items():
+            if not название.startswith(семейство):
+                continue
+            кривые = json.loads(Path(f"results/{название}.json").read_text())
+            нужно = [нужный_snr(кривые[к]) for к in кривые]
+            sdr = сигнал_искажение(искажение, qpsk)
+            точки.append((sdr, *нужно))
+            print(f"| {название} | {гармоника} | {sdr:.1f} | {нужно[0]:.1f} | {нужно[1]:.1f} | {нужно[2]:.1f} | {нужно[1] - нужно[0]:.1f} |")
+        точки = np.array(точки)
+        ось.plot(точки[:, 0], точки[:, 2] - точки[:, 1], маркер + "-", label=f"{семейство}: выигрыш CNN над MMSE")
+        ось.plot(точки[:, 0], точки[:, 3] - точки[:, 1], маркер + ":", label=f"{семейство}: выигрыш CNN над OFDM")
+    чистый = json.loads(Path("results/без искажений.json").read_text())
+    нужно = [нужный_snr(чистый[к]) for к in чистый]
+    print(f"| без искажений | — | ∞ | {нужно[0]:.1f} | {нужно[1]:.1f} | {нужно[2]:.1f} | {нужно[1] - нужно[0]:.1f} |")
+    ось.axhline(0, color="k", lw=0.8)
+    ось.invert_xaxis()
+    ось.set(xlabel="сигнал/искажения для QPSK, дБ (правее — сильнее нелинейность)", ylabel="выигрыш по Eb/N0 при BER 10⁻³, дБ", title="Чем сильнее нелинейность, тем больше выигрывает CNN")
+    ось.grid(alpha=0.3)
+    ось.legend()
+    plt.tight_layout()
+    plt.savefig("figures/cnn_серия.png", dpi=150)
 
 
 if __name__ == "__main__":
     torch.manual_seed(0)
     np.random.seed(0)
-    for название in sys.argv[1:] or СЦЕНАРИИ:
-        сравнить(название)
+    if sys.argv[1:] == ["серия"]:
+        for название, (метка, искажение, _) in СЕРИЯ.items():
+            if not Path(f"results/{название}.json").exists():
+                сравнить(название, метка, искажение)
+        график_серии()
+    else:
+        for название in sys.argv[1:] or СЦЕНАРИИ:
+            сравнить(название, *СЦЕНАРИИ[название])
